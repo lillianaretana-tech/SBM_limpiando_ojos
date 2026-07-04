@@ -156,7 +156,8 @@
   .pinrow input{flex:1}
   .pinmsg{color:var(--stop,#C5283D);font-size:15px;font-weight:600;margin-top:10px;min-height:18px}
   .toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:14px}
-  .toolbar input{flex:1;min-width:160px;font-size:16px;padding:11px 14px;border:2px solid var(--line);border-radius:10px;font-family:inherit}
+  .toolbar input,.toolbar select{flex:1;min-width:150px;font-size:16px;padding:11px 14px;border:2px solid var(--line);border-radius:10px;font-family:inherit;background:#fff;color:var(--ink)}
+  .toolbar select{cursor:pointer}
   .xbtn{border:none;cursor:pointer;font-family:inherit;font-weight:800;font-size:15px;padding:11px 16px;border-radius:10px;color:#fff;white-space:nowrap}
   .xbtn.xls{background:#127A4B}
   .xbtn.pdf{background:#C5283D}
@@ -538,14 +539,65 @@ function fmtFecha(iso){
   try { return new Date(iso).toLocaleDateString('es-CR',{day:'2-digit',month:'2-digit',year:'numeric'}); } catch(e){ return iso; }
 }
 
-function filtrados(q){
-  q=(q||"").trim().toLowerCase();
-  if(!q) return REGISTROS;
-  return REGISTROS.filter(r=>(r.nombre||"").toLowerCase().includes(q)||(r.proyecto||"").toLowerCase().includes(q));
+function fechaRegistro(r){
+  const d = new Date(r.created_at);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function renderTabla(q){
-  const rows = filtrados(q);
+function nombreMes(n){
+  return new Date(2020, n-1, 1).toLocaleDateString('es-CR',{month:'long'});
+}
+
+function filtrosIniciales(filtros){
+  if(typeof filtros === "string") return { q:filtros, proyecto:"", mes:"", anio:"" };
+  return Object.assign({ q:"", proyecto:"", mes:"", anio:"" }, filtros||{});
+}
+
+function opcionesFiltros(){
+  const proyectos = [...new Set(REGISTROS.map(r=>(r.proyecto||"").trim()).filter(Boolean))]
+    .sort((a,b)=>a.localeCompare(b,'es'));
+  const anios = [...new Set(REGISTROS.map(r=>{
+    const d = fechaRegistro(r);
+    return d ? String(d.getFullYear()) : "";
+  }).filter(Boolean))].sort((a,b)=>Number(b)-Number(a));
+  return { proyectos, anios };
+}
+
+function filtrados(filtros){
+  const f = filtrosIniciales(filtros);
+  const q = (f.q||"").trim().toLowerCase();
+  return REGISTROS.filter(r=>{
+    const d = fechaRegistro(r);
+    const proyecto = (r.proyecto||"").trim();
+    const coincideTexto = !q || (r.nombre||"").toLowerCase().includes(q) || proyecto.toLowerCase().includes(q);
+    const coincideProyecto = !f.proyecto || proyecto === f.proyecto;
+    const coincideMes = !f.mes || (d && String(d.getMonth()+1) === String(f.mes));
+    const coincideAnio = !f.anio || (d && String(d.getFullYear()) === String(f.anio));
+    return coincideTexto && coincideProyecto && coincideMes && coincideAnio;
+  });
+}
+
+function resumenFiltros(filtros){
+  const f = filtrosIniciales(filtros);
+  const partes = [];
+  if(f.q) partes.push(`busqueda "${f.q}"`);
+  if(f.proyecto) partes.push(`proyecto ${f.proyecto}`);
+  if(f.mes) partes.push(`mes ${nombreMes(Number(f.mes))}`);
+  if(f.anio) partes.push(`año ${f.anio}`);
+  return partes.length ? partes.join(" · ") : "todos los registros";
+}
+
+function renderTabla(filtros){
+  const f = filtrosIniciales(filtros);
+  const q = f.q;
+  const rows = filtrados(f);
+  const opts = opcionesFiltros();
+  const proyectosHtml = opts.proyectos.map(p=>`<option value="${escapeHtml(p)}"${p===f.proyecto?" selected":""}>${escapeHtml(p)}</option>`).join("");
+  const aniosHtml = opts.anios.map(a=>`<option value="${escapeHtml(a)}"${a===f.anio?" selected":""}>${escapeHtml(a)}</option>`).join("");
+  const mesesHtml = Array.from({length:12},(_,i)=>{
+    const m = String(i+1);
+    return `<option value="${m}"${m===String(f.mes)?" selected":""}>${nombreMes(i+1)}</option>`;
+  }).join("");
   const body = rows.length ? rows.map(r=>`
     <tr>
       <td>${fmtFecha(r.created_at)}</td>
@@ -557,11 +609,25 @@ function renderTabla(q){
   adminBody.innerHTML = `
     <div class="toolbar">
       <input id="buscar" type="text" placeholder="Buscar por nombre o proyecto…" value="${escapeHtml(q||"")}">
+      <select id="fProyecto" aria-label="Filtrar por proyecto">
+        <option value="">Todos los proyectos</option>
+        ${proyectosHtml}
+      </select>
+      <select id="fMes" aria-label="Filtrar por mes">
+        <option value="">Todos los meses</option>
+        ${mesesHtml}
+      </select>
+      <select id="fAnio" aria-label="Filtrar por año">
+        <option value="">Todos los años</option>
+        ${aniosHtml}
+      </select>
+      <button class="xbtn rf" id="limpiarFiltros">Limpiar</button>
       <button class="xbtn rf" id="refrescar">Refrescar</button>
       <button class="xbtn xls" id="expXls">Excel</button>
       <button class="xbtn pdf" id="expPdf">PDF</button>
     </div>
     <div class="pcount">${rows.length} registro(s)${q?` · filtrando "${escapeHtml(q)}"`:""}</div>
+    <div class="pcount">Filtros activos: ${escapeHtml(resumenFiltros(f))}</div>
     <div class="tablewrap">
       <table class="reg">
         <thead><tr><th>Fecha</th><th>Nombre</th><th>Proyecto</th><th>Aciertos</th><th>Resultado</th></tr></thead>
@@ -569,14 +635,24 @@ function renderTabla(q){
       </table>
     </div>`;
   const buscar=document.getElementById('buscar');
-  buscar.addEventListener('input', ()=>{ const v=buscar.value; const pos=buscar.selectionStart; renderTabla(v); const nb=document.getElementById('buscar'); nb.focus(); try{nb.setSelectionRange(pos,pos);}catch(e){} });
+  const leerFiltros=()=>({
+    q: document.getElementById('buscar').value,
+    proyecto: document.getElementById('fProyecto').value,
+    mes: document.getElementById('fMes').value,
+    anio: document.getElementById('fAnio').value
+  });
+  buscar.addEventListener('input', ()=>{ const next=leerFiltros(); const pos=buscar.selectionStart; renderTabla(next); const nb=document.getElementById('buscar'); nb.focus(); try{nb.setSelectionRange(pos,pos);}catch(e){} });
+  document.getElementById('fProyecto').addEventListener('change', ()=>renderTabla(leerFiltros()));
+  document.getElementById('fMes').addEventListener('change', ()=>renderTabla(leerFiltros()));
+  document.getElementById('fAnio').addEventListener('change', ()=>renderTabla(leerFiltros()));
+  document.getElementById('limpiarFiltros').addEventListener('click', ()=>renderTabla({}));
   document.getElementById('refrescar').addEventListener('click', loadRegistros);
-  document.getElementById('expXls').addEventListener('click', ()=>exportarExcel(q));
-  document.getElementById('expPdf').addEventListener('click', ()=>exportarPDF(q));
+  document.getElementById('expXls').addEventListener('click', ()=>exportarExcel(leerFiltros()));
+  document.getElementById('expPdf').addEventListener('click', ()=>exportarPDF(leerFiltros()));
 }
 
-function datosExport(q){
-  return filtrados(q).map(r=>({
+function datosExport(filtros){
+  return filtrados(filtros).map(r=>({
     Fecha: fmtFecha(r.created_at),
     Nombre: r.nombre||"",
     Proyecto: r.proyecto||"",
@@ -585,18 +661,28 @@ function datosExport(q){
   }));
 }
 
-function exportarExcel(q){
-  const datos = datosExport(q);
+function nombreArchivo(filtros, ext){
+  const f = filtrosIniciales(filtros);
+  const partes = ["Limpiando_con_los_Ojos"];
+  if(f.proyecto) partes.push(f.proyecto.replace(/[^\w-]+/g,"_"));
+  if(f.anio) partes.push(f.anio);
+  if(f.mes) partes.push(String(f.mes).padStart(2,"0"));
+  partes.push(hoyStr());
+  return `${partes.join("_")}.${ext}`;
+}
+
+function exportarExcel(filtros){
+  const datos = datosExport(filtros);
   if(!datos.length){ alert("No hay registros para exportar."); return; }
   const ws = XLSX.utils.json_to_sheet(datos);
   ws['!cols'] = [{wch:12},{wch:28},{wch:20},{wch:10},{wch:12}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, "Registros");
-  XLSX.writeFile(wb, `Limpiando_con_los_Ojos_${hoyStr()}.xlsx`);
+  XLSX.writeFile(wb, nombreArchivo(filtros, "xlsx"));
 }
 
-function exportarPDF(q){
-  const datos = datosExport(q);
+function exportarPDF(filtros){
+  const datos = datosExport(filtros);
   if(!datos.length){ alert("No hay registros para exportar."); return; }
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF();
@@ -604,15 +690,16 @@ function exportarPDF(q){
   doc.text("Limpiando con los Ojos — Registros de capacitación", 14, 16);
   doc.setFontSize(10); doc.setTextColor(90);
   doc.text(`SBM Costa Rica · Generado el ${hoyStr()} · ${datos.length} registro(s)`, 14, 23);
+  doc.text(`Filtros: ${resumenFiltros(filtros)}`, 14, 29);
   doc.autoTable({
-    startY: 28,
+    startY: 34,
     head: [["Fecha","Nombre","Proyecto","Aciertos","Resultado"]],
     body: datos.map(d=>[d.Fecha,d.Nombre,d.Proyecto,d.Aciertos,d.Resultado]),
     styles:{ fontSize:9, cellPadding:3 },
     headStyles:{ fillColor:[28,92,120], textColor:255, fontStyle:'bold' },
     alternateRowStyles:{ fillColor:[247,244,239] }
   });
-  doc.save(`Limpiando_con_los_Ojos_${hoyStr()}.pdf`);
+  doc.save(nombreArchivo(filtros, "pdf"));
 }
 
 function hoyStr(){ const d=new Date(); const p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`; }
