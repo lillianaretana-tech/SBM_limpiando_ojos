@@ -172,7 +172,7 @@
   .pempty{text-align:center;color:var(--ink-soft);padding:30px;font-size:16px}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 </head>
@@ -651,14 +651,98 @@ function renderTabla(filtros){
   document.getElementById('expPdf').addEventListener('click', ()=>exportarPDF(leerFiltros()));
 }
 
-function datosExport(filtros){
-  return filtrados(filtros).map(r=>({
-    Fecha: fmtFecha(r.created_at),
-    Nombre: r.nombre||"",
-    Proyecto: r.proyecto||"",
-    Aciertos: `${r.aciertos??""}/${r.total??""}`,
-    Resultado: "Aprobado"
-  }));
+/* ---------- Unificación de nombres (mismo proyecto) ---------- */
+const STOP_NOMBRES = new Set(["de","del","la","las","los","el","y","san","santa","don","dona","mc","van","von"]);
+
+function quitarAcentos(s){
+  return String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"");
+}
+
+function tokensNombre(nombre){
+  const limpio = quitarAcentos(nombre).toLowerCase().trim();
+  if(!limpio) return [];
+  return limpio.split(/\s+/).filter(t=>t.length>=2 && !STOP_NOMBRES.has(t));
+}
+
+// Dos nombres se consideran la misma persona si uno es "contenido" en el otro
+// (ej. "Juan" dentro de "Juan Pérez Rodríguez") o si comparten al menos 2 palabras
+// significativas (ej. nombre + apellido), para evitar juntar personas distintas
+// que solo comparten un apellido común.
+function esMismaPersona(a,b){
+  const ta = tokensNombre(a), tb = tokensNombre(b);
+  if(!ta.length || !tb.length) return false;
+  const setA = new Set(ta), setB = new Set(tb);
+  const comunes = new Set(ta.filter(t=>setB.has(t)));
+  if(!comunes.size) return false;
+  const esSubconjunto = (arr,set) => arr.every(t=>set.has(t));
+  if(esSubconjunto(ta,setB) || esSubconjunto(tb,setA)) return true;
+  return comunes.size >= 2;
+}
+
+function agruparPersonas(registros){
+  const n = registros.length;
+  const parent = Array.from({length:n},(_,i)=>i);
+  const find = i => { while(parent[i]!==i){ parent[i]=parent[parent[i]]; i=parent[i]; } return i; };
+  const union = (i,j) => { const ri=find(i), rj=find(j); if(ri!==rj) parent[ri]=rj; };
+  for(let i=0;i<n;i++){
+    for(let j=i+1;j<n;j++){
+      if(esMismaPersona(registros[i].nombre||"", registros[j].nombre||"")) union(i,j);
+    }
+  }
+  const gruposPorRaiz = new Map();
+  for(let i=0;i<n;i++){
+    const r = find(i);
+    if(!gruposPorRaiz.has(r)) gruposPorRaiz.set(r, []);
+    gruposPorRaiz.get(r).push(i);
+  }
+  const canonicoPorIndice = new Array(n);
+  const clusters = [];
+  for(const indices of gruposPorRaiz.values()){
+    const nombresVistos = [...new Set(indices.map(i=>(registros[i].nombre||"").trim()).filter(Boolean))];
+    let canonico = nombresVistos[0] || "";
+    nombresVistos.forEach(nm=>{
+      const tCanon = tokensNombre(canonico).length, tNm = tokensNombre(nm).length;
+      if(tNm>tCanon || (tNm===tCanon && nm.length>canonico.length)) canonico = nm;
+    });
+    indices.forEach(i=>canonicoPorIndice[i]=canonico);
+    clusters.push({ canonico, variantes: nombresVistos.filter(v=>v!==canonico), indices });
+  }
+  return { canonicoPorIndice, clusters };
+}
+
+// Agrupa los registros filtrados por proyecto y, dentro de cada proyecto,
+// unifica las personas que escribieron su nombre de forma distinta.
+function prepararReporte(filtros){
+  const rows = filtrados(filtros);
+  const porProyecto = new Map();
+  rows.forEach(r=>{
+    const p = (r.proyecto||"").trim() || "Sin proyecto";
+    if(!porProyecto.has(p)) porProyecto.set(p, []);
+    porProyecto.get(p).push(r);
+  });
+  const proyectos = [...porProyecto.keys()].sort((a,b)=>a.localeCompare(b,'es'));
+  return proyectos.map(proyecto=>{
+    const registrosProyecto = porProyecto.get(proyecto);
+    const { canonicoPorIndice, clusters } = agruparPersonas(registrosProyecto);
+    const registros = registrosProyecto
+      .map((r,i)=>({ ...r, nombreOriginal:(r.nombre||"").trim(), nombreUnificado: canonicoPorIndice[i] }))
+      .sort((a,b)=> new Date(b.created_at) - new Date(a.created_at));
+    const personas = clusters.map(c=>{
+      const regs = c.indices.map(i=>registrosProyecto[i]);
+      const fechas = regs.map(fechaRegistro).filter(Boolean);
+      const ultimaFecha = fechas.length ? new Date(Math.max(...fechas.map(d=>d.getTime()))) : null;
+      const totalAciertos = regs.reduce((s,r)=>s+(Number(r.aciertos)||0),0);
+      const totalPreguntas = regs.reduce((s,r)=>s+(Number(r.total)||0),0);
+      return {
+        nombre: c.canonico,
+        variantes: c.variantes,
+        registros: regs.length,
+        ultimaFecha,
+        promedio: totalPreguntas ? Math.round((totalAciertos/totalPreguntas)*100) : null
+      };
+    }).sort((a,b)=>a.nombre.localeCompare(b.nombre,'es'));
+    return { proyecto, registros, personas };
+  });
 }
 
 function nombreArchivo(filtros, ext){
@@ -671,34 +755,305 @@ function nombreArchivo(filtros, ext){
   return `${partes.join("_")}.${ext}`;
 }
 
-function exportarExcel(filtros){
-  const datos = datosExport(filtros);
-  if(!datos.length){ alert("No hay registros para exportar."); return; }
-  const ws = XLSX.utils.json_to_sheet(datos);
-  ws['!cols'] = [{wch:12},{wch:28},{wch:20},{wch:10},{wch:12}];
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, "Registros");
-  XLSX.writeFile(wb, nombreArchivo(filtros, "xlsx"));
+/* ---------- Exportar Excel (ExcelJS, con formato y hojas por proyecto) ---------- */
+const XCOLOR = {
+  teal:"FF1C5C78", tealDeep:"FF154B62", tealSoft:"FFE6F0F4",
+  orange:"FFE0701D", orangeDeep:"FFB25415",
+  ink:"FF21303A", inkSoft:"FF5E6B73", white:"FFFFFFFF",
+  line:"FFE8E1D5", rowAlt:"FFFBF9F5"
+};
+
+function bordeFino(){
+  return {
+    top:{style:'thin',color:{argb:XCOLOR.line}}, left:{style:'thin',color:{argb:XCOLOR.line}},
+    bottom:{style:'thin',color:{argb:XCOLOR.line}}, right:{style:'thin',color:{argb:XCOLOR.line}}
+  };
 }
 
+function nombreHoja(proyecto, usados){
+  let base = proyecto.replace(/[\*\?:\\\/\[\]]/g,"").trim().slice(0,31) || "Proyecto";
+  let nombre = base, n=2;
+  while(usados.has(nombre)){ nombre = (base.slice(0,28)+"_"+n).slice(0,31); n++; }
+  usados.add(nombre);
+  return nombre;
+}
+
+function descargarBlob(buffer, filename, mime){
+  const blob = new Blob([buffer], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 2000);
+}
+
+async function exportarExcel(filtros){
+  const reporte = prepararReporte(filtros);
+  const totalRegistros = reporte.reduce((s,p)=>s+p.registros.length,0);
+  if(!totalRegistros){ alert("No hay registros para exportar."); return; }
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = "Lilliana Retana Tech";
+  wb.created = new Date();
+
+  /* --- Hoja Resumen --- */
+  const resumen = wb.addWorksheet("Resumen");
+  resumen.columns = [{width:30},{width:14},{width:16},{width:20},{width:14}];
+
+  resumen.mergeCells('A1:E1');
+  const t1 = resumen.getCell('A1');
+  t1.value = "Limpiando con los Ojos — Reporte de capacitación";
+  t1.font = { bold:true, size:15, color:{argb:XCOLOR.white} };
+  t1.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.teal} };
+  t1.alignment = { vertical:'middle' };
+  resumen.getRow(1).height = 26;
+
+  resumen.mergeCells('A2:E2');
+  const t2 = resumen.getCell('A2');
+  t2.value = `SBM Costa Rica · Generado el ${hoyStr()} · Filtros: ${resumenFiltros(filtros)}`;
+  t2.font = { italic:true, size:10, color:{argb:XCOLOR.inkSoft} };
+  resumen.getRow(2).height = 18;
+
+  const encabezados = ["Proyecto","Registros","Personas únicas","Última capacitación","Aprobados"];
+  const filaEnc = resumen.getRow(4);
+  encabezados.forEach((h,i)=>{
+    const c = filaEnc.getCell(i+1);
+    c.value = h;
+    c.font = { bold:true, color:{argb:XCOLOR.white} };
+    c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.teal} };
+    c.alignment = { vertical:'middle', horizontal: i===0?'left':'center' };
+    c.border = bordeFino();
+  });
+  filaEnc.height = 20;
+
+  let fila = 5;
+  reporte.forEach((p,idx)=>{
+    const ultima = p.registros.reduce((max,r)=>{ const d=fechaRegistro(r); return d && (!max||d>max) ? d : max; }, null);
+    const r = resumen.getRow(fila);
+    r.getCell(1).value = p.proyecto;
+    r.getCell(2).value = p.registros.length;
+    r.getCell(3).value = p.personas.length;
+    r.getCell(4).value = ultima ? fmtFecha(ultima) : "";
+    r.getCell(5).value = p.registros.length;
+    for(let c=1;c<=5;c++){
+      r.getCell(c).border = bordeFino();
+      r.getCell(c).alignment = { horizontal: c===1?'left':'center' };
+      if(idx%2===1) r.getCell(c).fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.rowAlt} };
+    }
+    fila++;
+  });
+  const totalRow = resumen.getRow(fila);
+  totalRow.getCell(1).value = "TOTAL";
+  totalRow.getCell(2).value = totalRegistros;
+  totalRow.getCell(3).value = reporte.reduce((s,p)=>s+p.personas.length,0);
+  totalRow.getCell(5).value = totalRegistros;
+  for(let c=1;c<=5;c++){
+    totalRow.getCell(c).font = { bold:true };
+    totalRow.getCell(c).border = { top:{style:'double'} };
+    totalRow.getCell(c).alignment = { horizontal: c===1?'left':'center' };
+  }
+  resumen.views = [{ state:'frozen', ySplit:4 }];
+
+  /* --- Una hoja por proyecto --- */
+  const usados = new Set(["Resumen"]);
+  reporte.forEach(p=>{
+    const hoja = wb.addWorksheet(nombreHoja(p.proyecto, usados));
+    hoja.columns = [{width:14},{width:32},{width:34},{width:12},{width:16}];
+
+    hoja.mergeCells('A1:E1');
+    const h1 = hoja.getCell('A1');
+    h1.value = `${p.proyecto} — Capacitación "Limpiando con los Ojos"`;
+    h1.font = { bold:true, size:14, color:{argb:XCOLOR.white} };
+    h1.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.teal} };
+    h1.alignment = { vertical:'middle' };
+    hoja.getRow(1).height = 24;
+
+    hoja.mergeCells('A2:E2');
+    const h2 = hoja.getCell('A2');
+    h2.value = `${p.registros.length} registro(s) · ${p.personas.length} persona(s) única(s) · Generado el ${hoyStr()}`;
+    h2.font = { italic:true, size:10, color:{argb:XCOLOR.inkSoft} };
+    hoja.getRow(2).height = 16;
+
+    let filaActual = 4;
+    hoja.getCell(`A${filaActual}`).value = "Personas identificadas";
+    hoja.getCell(`A${filaActual}`).font = { bold:true, size:12, color:{argb:XCOLOR.orangeDeep} };
+    filaActual++;
+
+    const encPersonas = ["Nombre unificado","Variantes detectadas","Registros","Última capacitación","Promedio"];
+    const filaEncP = hoja.getRow(filaActual);
+    encPersonas.forEach((hh,i)=>{
+      const c = filaEncP.getCell(i+1);
+      c.value = hh;
+      c.font = { bold:true, color:{argb:XCOLOR.white} };
+      c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.orange} };
+      c.border = bordeFino();
+      c.alignment = { vertical:'middle', horizontal:(i===0||i===1)?'left':'center' };
+    });
+    filaEncP.height = 18;
+    filaActual++;
+
+    p.personas.forEach((per,idx)=>{
+      const r = hoja.getRow(filaActual);
+      r.getCell(1).value = per.nombre;
+      r.getCell(2).value = per.variantes.length ? per.variantes.join(" · ") : "—";
+      r.getCell(3).value = per.registros;
+      r.getCell(4).value = per.ultimaFecha ? fmtFecha(per.ultimaFecha) : "";
+      r.getCell(5).value = per.promedio!==null ? `${per.promedio}%` : "";
+      for(let c=1;c<=5;c++){
+        r.getCell(c).border = bordeFino();
+        r.getCell(c).alignment = { horizontal:(c===1||c===2)?'left':'center', wrapText:c===2 };
+        if(idx%2===1) r.getCell(c).fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.rowAlt} };
+      }
+      filaActual++;
+    });
+
+    filaActual += 1;
+    hoja.getCell(`A${filaActual}`).value = "Detalle de registros";
+    hoja.getCell(`A${filaActual}`).font = { bold:true, size:12, color:{argb:XCOLOR.tealDeep} };
+    filaActual++;
+
+    const encDet = ["Fecha","Nombre (unificado)","Registrado como","Aciertos","Resultado"];
+    const filaEncD = hoja.getRow(filaActual);
+    encDet.forEach((hh,i)=>{
+      const c = filaEncD.getCell(i+1);
+      c.value = hh;
+      c.font = { bold:true, color:{argb:XCOLOR.white} };
+      c.fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.teal} };
+      c.border = bordeFino();
+      c.alignment = { vertical:'middle', horizontal:(i===1||i===2)?'left':'center' };
+    });
+    filaEncD.height = 18;
+    filaActual++;
+    const inicioDetalle = filaActual;
+
+    p.registros.forEach((r,idx)=>{
+      const filaR = hoja.getRow(filaActual);
+      filaR.getCell(1).value = fmtFecha(r.created_at);
+      filaR.getCell(2).value = r.nombreUnificado;
+      filaR.getCell(3).value = r.nombreOriginal !== r.nombreUnificado ? r.nombreOriginal : "—";
+      filaR.getCell(4).value = `${r.aciertos??""}/${r.total??""}`;
+      filaR.getCell(5).value = "Aprobado";
+      for(let c=1;c<=5;c++){
+        filaR.getCell(c).border = bordeFino();
+        filaR.getCell(c).alignment = { horizontal:(c===2||c===3)?'left':'center' };
+        if(idx%2===1) filaR.getCell(c).fill = { type:'pattern', pattern:'solid', fgColor:{argb:XCOLOR.rowAlt} };
+      }
+      filaR.getCell(5).font = { color:{argb:XCOLOR.teal}, bold:true };
+      filaActual++;
+    });
+
+    if(filaActual-1 >= inicioDetalle){
+      hoja.autoFilter = { from:{row:inicioDetalle-1, column:1}, to:{row:filaActual-1, column:5} };
+    }
+    hoja.views = [{ state:'frozen', ySplit: inicioDetalle-1 }];
+  });
+
+  const buffer = await wb.xlsx.writeBuffer();
+  descargarBlob(buffer, nombreArchivo(filtros,"xlsx"), "application/octet-stream");
+}
+
+/* ---------- Exportar PDF (mismo nivel de detalle que el Excel) ---------- */
 function exportarPDF(filtros){
-  const datos = datosExport(filtros);
-  if(!datos.length){ alert("No hay registros para exportar."); return; }
+  const reporte = prepararReporte(filtros);
+  const totalRegistros = reporte.reduce((s,p)=>s+p.registros.length,0);
+  if(!totalRegistros){ alert("No hay registros para exportar."); return; }
+
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF();
-  doc.setFontSize(15); doc.setTextColor(28,92,120);
-  doc.text("Limpiando con los Ojos — Registros de capacitación", 14, 16);
-  doc.setFontSize(10); doc.setTextColor(90);
-  doc.text(`SBM Costa Rica · Generado el ${hoyStr()} · ${datos.length} registro(s)`, 14, 23);
-  doc.text(`Filtros: ${resumenFiltros(filtros)}`, 14, 29);
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const TEAL=[28,92,120], TEAL_DEEP=[21,75,98], ORANGE=[224,112,29], INK_SOFT=[94,107,115], ROW_ALT=[251,249,245], LINE=[232,225,213];
+
+  function banner(y, texto, color, size){
+    doc.setFillColor(...color);
+    doc.rect(10, y, pageWidth-20, 9, 'F');
+    doc.setTextColor(255,255,255);
+    doc.setFontSize(size);
+    doc.setFont(undefined,'bold');
+    doc.text(texto, 14, y+6.3);
+    doc.setFont(undefined,'normal');
+  }
+
+  banner(14, "Limpiando con los Ojos — Reporte de capacitación", TEAL, 14);
+  doc.setFontSize(10); doc.setTextColor(...INK_SOFT);
+  doc.text(`SBM Costa Rica · Generado el ${hoyStr()}`, 14, 30);
+  doc.text(`Filtros: ${resumenFiltros(filtros)}`, 14, 35);
+  doc.text(`${totalRegistros} registro(s) · ${reporte.length} proyecto(s) · ${reporte.reduce((s,p)=>s+p.personas.length,0)} persona(s) única(s)`, 14, 40);
+
   doc.autoTable({
-    startY: 34,
-    head: [["Fecha","Nombre","Proyecto","Aciertos","Resultado"]],
-    body: datos.map(d=>[d.Fecha,d.Nombre,d.Proyecto,d.Aciertos,d.Resultado]),
-    styles:{ fontSize:9, cellPadding:3 },
-    headStyles:{ fillColor:[28,92,120], textColor:255, fontStyle:'bold' },
-    alternateRowStyles:{ fillColor:[247,244,239] }
+    startY: 46,
+    head: [["Proyecto","Registros","Personas únicas","Última capacitación"]],
+    body: reporte.map(p=>{
+      const ultima = p.registros.reduce((max,r)=>{ const d=fechaRegistro(r); return d && (!max||d>max) ? d : max; }, null);
+      return [p.proyecto, String(p.registros.length), String(p.personas.length), ultima?fmtFecha(ultima):""];
+    }),
+    styles:{ fontSize:9, cellPadding:3, lineColor:LINE, lineWidth:0.1 },
+    headStyles:{ fillColor:TEAL, textColor:255, fontStyle:'bold' },
+    alternateRowStyles:{ fillColor:ROW_ALT },
+    columnStyles:{ 1:{halign:'center'}, 2:{halign:'center'}, 3:{halign:'center'} },
+    margin:{left:10,right:10}
   });
+
+  let y = doc.lastAutoTable.finalY + 14;
+
+  reporte.forEach(p=>{
+    if(y > 250){ doc.addPage(); y = 16; }
+    banner(y, p.proyecto, TEAL_DEEP, 12);
+    y += 13;
+    doc.setFontSize(9.5); doc.setTextColor(...INK_SOFT);
+    doc.text(`${p.registros.length} registro(s) · ${p.personas.length} persona(s) única(s)`, 14, y);
+    y += 4;
+
+    doc.autoTable({
+      startY: y,
+      head: [["Nombre unificado","Variantes detectadas","Registros","Última capacitación","Promedio"]],
+      body: p.personas.map(per=>[
+        per.nombre,
+        per.variantes.length ? per.variantes.join(" · ") : "—",
+        String(per.registros),
+        per.ultimaFecha ? fmtFecha(per.ultimaFecha) : "",
+        per.promedio!==null ? `${per.promedio}%` : ""
+      ]),
+      styles:{ fontSize:8.5, cellPadding:2.6, lineColor:LINE, lineWidth:0.1 },
+      headStyles:{ fillColor:ORANGE, textColor:255, fontStyle:'bold' },
+      alternateRowStyles:{ fillColor:ROW_ALT },
+      columnStyles:{ 2:{halign:'center'}, 3:{halign:'center'}, 4:{halign:'center'} },
+      margin:{left:10,right:10}
+    });
+    y = doc.lastAutoTable.finalY + 6;
+
+    if(y > 255){ doc.addPage(); y = 16; }
+    doc.setFontSize(10); doc.setTextColor(...TEAL_DEEP); doc.setFont(undefined,'bold');
+    doc.text("Detalle de registros", 14, y);
+    doc.setFont(undefined,'normal');
+    y += 3;
+
+    doc.autoTable({
+      startY: y,
+      head: [["Fecha","Nombre (unificado)","Registrado como","Aciertos","Resultado"]],
+      body: p.registros.map(r=>[
+        fmtFecha(r.created_at),
+        r.nombreUnificado,
+        r.nombreOriginal!==r.nombreUnificado ? r.nombreOriginal : "—",
+        `${r.aciertos??""}/${r.total??""}`,
+        "Aprobado"
+      ]),
+      styles:{ fontSize:8.5, cellPadding:2.6, lineColor:LINE, lineWidth:0.1 },
+      headStyles:{ fillColor:TEAL, textColor:255, fontStyle:'bold' },
+      alternateRowStyles:{ fillColor:ROW_ALT },
+      columnStyles:{ 3:{halign:'center'}, 4:{halign:'center'} },
+      margin:{left:10,right:10}
+    });
+    y = doc.lastAutoTable.finalY + 14;
+  });
+
+  const pageCount = doc.internal.getNumberOfPages();
+  for(let i=1;i<=pageCount;i++){
+    doc.setPage(i);
+    doc.setFontSize(8); doc.setTextColor(...INK_SOFT);
+    doc.text("Limpiando con los Ojos · SBM Costa Rica · Desarrollado por Lilliana Retana Tech", 14, 290);
+    doc.text(`Página ${i} de ${pageCount}`, pageWidth-14, 290, { align:'right' });
+  }
+
   doc.save(nombreArchivo(filtros, "pdf"));
 }
 
