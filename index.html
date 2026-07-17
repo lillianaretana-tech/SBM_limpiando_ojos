@@ -172,7 +172,7 @@
   .pempty{text-align:center;color:var(--ink-soft);padding:30px;font-size:16px}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 </head>
@@ -788,10 +788,15 @@ function descargarBlob(buffer, filename, mime){
 }
 
 async function exportarExcel(filtros){
+  if(typeof ExcelJS === "undefined"){
+    alert("No se pudo cargar el generador de Excel (revisá tu conexión a internet e intentá de nuevo). Si el problema sigue, avisale a Lilly.");
+    return;
+  }
   const reporte = prepararReporte(filtros);
   const totalRegistros = reporte.reduce((s,p)=>s+p.registros.length,0);
   if(!totalRegistros){ alert("No hay registros para exportar."); return; }
 
+  try {
   const wb = new ExcelJS.Workbook();
   wb.creator = "Lilliana Retana Tech";
   wb.created = new Date();
@@ -950,6 +955,10 @@ async function exportarExcel(filtros){
 
   const buffer = await wb.xlsx.writeBuffer();
   descargarBlob(buffer, nombreArchivo(filtros,"xlsx"), "application/octet-stream");
+  } catch(e){
+    console.error("Error al generar el Excel:", e);
+    alert("Ocurrió un error generando el Excel. Revisá la consola del navegador (F12) para más detalle.");
+  }
 }
 
 /* ---------- Exportar PDF (mismo nivel de detalle que el Excel) ---------- */
